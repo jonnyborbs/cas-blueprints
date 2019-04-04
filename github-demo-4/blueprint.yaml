@@ -1,0 +1,167 @@
+name: GitHub-Demo-BP-4
+version: 1
+formatVersion: 1
+inputs:
+  env:
+    type: string
+    enum:
+      - Dev
+      - Test
+      - Prod
+    default: Prod
+    title: Environment
+    description: Target Environment
+  size:
+    type: string
+    enum:
+      - small
+      - medium
+    default: small
+    description: Size of Nodes
+    title: Node Size
+  image:
+    type: string
+    enum:
+      - coreos
+      - ubuntu
+    default: ubuntu
+    title: Select Image/OS
+  count:
+    type: integer
+    default: 2
+    maximum: 5
+    minimum: 2
+    title: Wordpress Cluster Size
+    description: Wordpress Cluster Size (Number of nodes)
+  clusterSize:
+    type: string
+    enum:
+      - small
+      - medium
+      - large
+    default: small
+    title: Wordpress Cluster Size
+    description: Wordpress Cluster Size
+  archiveDiskSize:
+    type: number
+    default: 4
+    maximum: 10
+    title: Wordpress Archive Disk Size
+    description: Size of Wordpress archive disk
+  databaseDiskSize:
+    type: number
+    default: 4
+    maximum: 10
+    title: MySQL Data Disk Size
+    description: Size of database disk
+  username:
+    type: string
+    minLength: 4
+    maxLength: 20
+    pattern: '[a-z]+'
+    title: Database Username
+    description: Database Username
+  userpassword:
+    type: string
+    pattern: '[a-z0-9A-Z@#$]+'
+    encrypted: true
+    title: Database Password
+    description: Database Password
+resources:
+  DBTier:
+    type: Cloud.vSphere.Machine
+    properties:
+      name: mysql
+      flavor: '${input.size}'
+      image: '${input.image}'
+      constraints:
+        - tag: '${"env:" + to_lower(input.env)}'
+      storage:
+        disks:
+          - capacityGb: '${input.databaseDiskSize}'
+            name: DatabaseDisk
+      networks:
+        - name: '${resource.WPNetworkPrivate.name}'
+      cloudConfig: |
+        #cloud-config
+        repo_update: true
+        repo_upgrade: all
+
+        packages:
+         - mysql-server
+
+        runcmd:
+         - sed -e '/bind-address/ s/^#*/#/' -i /etc/mysql/mysql.conf.d/mysqld.cnf
+         - service mysql restart
+         - mysql -e "GRANT ALL PRIVILEGES ON *.* TO '${input.username}'@'%' IDENTIFIED BY '${input.userpassword}';"
+         - mysql -e "FLUSH PRIVILEGES;"
+  WebTier:
+    type: Cloud.vSphere.Machine
+    properties:
+      name: wordpress
+      flavor: '${input.size}'
+      image: '${input.image}'
+      constraints:
+        - tag: '${"env:" + to_lower(input.env)}'
+      count: '${input.clusterSize== "small" ? 2 : (input.clusterSize == "medium" ? 3 : 4)}'
+      networks:
+        - name: '${resource.WPNetworkPrivate.name}'
+      storage:
+        disks:
+          - capacityGb: '${input.archiveDiskSize}'
+            name: ArchiveDisk
+      cloudConfig: |
+        #cloud-config
+        repo_update: true
+        repo_upgrade: all
+
+        packages:
+         - apache2
+         - php
+         - php-mysql
+         - libapache2-mod-php
+         - php-mcrypt
+         - mysql-client
+
+        runcmd:
+         - mkdir -p /var/www/html/mywordpresssite && cd /var/www/html && wget https://wordpress.org/latest.tar.gz && tar -xzf /var/www/html/latest.tar.gz -C /var/www/html/mywordpresssite --strip-components 1
+         - i=0; while [ $i -le 10 ]; do mysql --connect-timeout=3 -h ${resource.DBTier.networks[0].address} -u ${input.username} -p${input.userpassword} -e "SHOW STATUS;" && break || sleep 15; i=$((i+1)); done
+         - mysql -u ${input.username} -p${input.userpassword} -h ${resource.DBTier.networks[0].address} -e "create database wordpress_blog;"
+         - mv /var/www/html/mywordpresssite/wp-config-sample.php /var/www/html/mywordpresssite/wp-config.php
+         - sed -i -e s/"define('DB_NAME', 'database_name_here');"/"define('DB_NAME', 'wordpress_blog');"/ /var/www/html/mywordpresssite/wp-config.php && sed -i -e s/"define('DB_USER', 'username_here');"/"define('DB_USER', '${input.username}');"/ /var/www/html/mywordpresssite/wp-config.php && sed -i -e s/"define('DB_PASSWORD', 'password_here');"/"define('DB_PASSWORD', '${input.userpassword}');"/ /var/www/html/mywordpresssite/wp-config.php && sed -i -e s/"define('DB_HOST', 'localhost');"/"define('DB_HOST', '${resource.DBTier.networks[0].address}');"/ /var/www/html/mywordpresssite/wp-config.php
+         - service apache2 reload
+  LoadBalancer:
+    type: Cloud.LoadBalancer
+    properties:
+      name: WPAppLB
+      network: '${resource.WPNetworkPublic.name}'
+      instances:
+        - '${resource.WebTier.id}'
+      routes:
+        - protocol: HTTP
+          port: '80'
+          instanceProtocol: HTTP
+          instancePort: '80'
+          healthCheckConfiguration:
+            protocol: HTTP
+            port: '80'
+            urlPath: /mywordpresssite/wp-admin/install.php
+            intervalSeconds: 6
+            timeoutSeconds: 5
+            unhealthyThreshold: 2
+            healthyThreshold: 2
+      internetFacing: false
+  WPNetworkPrivate:
+    type: Cloud.Network
+    properties:
+      name: WPNetworkPrivate
+      networkType: existing
+      constraints:
+        - tag: 'type:isolated-net'
+  WPNetworkPublic:
+    type: Cloud.Network
+    properties:
+      name: WPNetworkPublic
+      networkType: existing
+      constraints:
+        - tag: 'type:public-net'
